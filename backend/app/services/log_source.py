@@ -108,7 +108,7 @@ class LogSourceService(BaseModuleService):
             "auto_triggers": triggers,
         }
 
-    def collect_from_source(self, source_id: int, batch_size: int = 100) -> dict[str, Any]:
+    def collect_from_source(self, source_id: int, batch_size: int = 100, lines: list[str] | None = None) -> dict[str, Any]:
         """从指定日志源采集一批日志行到本地日志文件。"""
         source = store.find(self.MODULE, source_id)
         if source is None:
@@ -117,16 +117,25 @@ class LogSourceService(BaseModuleService):
             return {"error": f"日志源 {source_id} 未接入，当前状态: {source.get('status')}"}
 
         cp = self._read_checkpoint(source["源编号"]) or {"offset": 0, "line_number": 0}
-        lines = self._simulate_log_lines(source, count=batch_size)
+        # 续采入口：读取逐行累计字节位点，核对存量位置后确认本批实际起点
+        cp = self._confirm_resume_start(source["源编号"], cp)
+
+        if lines is None:
+            lines = self._simulate_log_lines(source, count=batch_size)
+        else:
+            lines = [str(line) for line in lines]
         start_line = cp["line_number"]
 
         records = []
+        offset = cp["offset"]
         for i, line in enumerate(lines):
+            # 行末位置按原始日志的 UTF-8 字节及换行逐行累计
+            offset += len(line.encode("utf-8")) + 1
             records.append({
                 "source_key": source["源编号"],
                 "source_name": source["源名称"],
                 "line_no": start_line + i + 1,
-                "offset": cp["offset"] + len(line.encode("utf-8")) + 1,
+                "offset": offset,
                 "raw": line,
                 "collected_at": time.time(),
             })
@@ -135,7 +144,8 @@ class LogSourceService(BaseModuleService):
         written = self._write_jsonl(output_file, records)
 
         new_line = start_line + written
-        new_offset = cp["offset"] + sum(len(r["raw"].encode("utf-8")) + 1 for r in records)
+        # 批末确认位置与最后一行的累计行末位点一致
+        new_offset = offset
         self._write_checkpoint(source["源编号"], {
             "source_key": source["源编号"],
             "offset": new_offset,
@@ -150,6 +160,7 @@ class LogSourceService(BaseModuleService):
             "written": written,
             "start_line": start_line,
             "end_line": new_line,
+            "resume_offset": cp["offset"],
             "checkpoint_offset": new_offset,
         }
 
@@ -163,6 +174,19 @@ class LogSourceService(BaseModuleService):
                 result["auto_mapping"] = map_r
 
         return result
+
+    def _confirm_resume_start(self, source_key: str, cp: dict[str, Any]) -> dict[str, Any]:
+        """续采前核对存量位点与采集原文，返回确认后的位点作为本批实际起点。"""
+        try:
+            cls = self._safe_import("app.services.collect_checkpoint", "CollectCheckpointService")
+            confirmed = cls().confirm_resume_offset(source_key)
+            if "offset" in confirmed:
+                cp = dict(cp)
+                cp["offset"] = confirmed["offset"]
+                cp["line_number"] = confirmed.get("line_number", cp.get("line_number", 0))
+        except Exception:
+            pass
+        return cp
 
     def get_active_sources(self) -> list[dict[str, Any]]:
         """获取所有已接入的活跃日志源。"""
